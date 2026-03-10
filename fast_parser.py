@@ -102,7 +102,7 @@ class LuaJITFastParser:
             pass
         return "Unknown Lua error"
     
-    def parse_file(self, filepath: str) -> Optional[ADOBMDData]:
+    def parse_file_old(self, filepath: str) -> Optional[ADOBMDData]:
         """
         Parse ADOBMD file using LuaJIT
         
@@ -180,6 +180,65 @@ class LuaJITFastParser:
             traceback.print_exc()
             return None
     
+    def parse_file(self, filepath: str) -> Optional[ADOBMDData]:
+        """Parse ADOBMD file using LuaJIT"""
+        if not os.path.exists(filepath):
+            print(f"[Error] File not found: {filepath}")
+            return None
+        
+        # Initialize if needed
+        if not self.parser_loaded:
+            if not self.initialize():
+                return None
+        
+        start_time = time.time()
+        
+        try:
+            # Read file
+            with open(filepath, 'r', encoding='utf-8') as f:
+                content = f.read()
+            
+            # Call LuaJIT parser
+            escaped_content = self._escape_lua_string(content)
+            result_str = self.lua.call_function_str(
+                self.L,
+                "M.parse_file",
+                escaped_content
+            )
+            
+            if not result_str or result_str == "":
+                print("[Error] Parser returned empty result")
+                # Try to get error from Lua
+                error = self._get_last_error()
+                if error:
+                    print(f"[Error] Lua error: {error}")
+                return None
+            
+            # Debug: print first 200 chars of result
+            print(f"[Debug] Lua result preview: {result_str[:200]}")
+            
+            # Parse JSON result
+            try:
+                result = json.loads(result_str)
+            except json.JSONDecodeError as e:
+                print(f"[Error] Failed to parse JSON result: {e}")
+                print(f"Result preview: {result_str[:500]}")
+                return None
+            
+            # Convert to ADOBMDData
+            data = self._convert_to_adobmd_data(result, filepath)
+            
+            elapsed = time.time() - start_time
+            print(f"⚡ LuaJIT parsed {len(data.atoms)} atoms in {elapsed*1000:.1f}ms")
+            
+            return data
+            
+        except Exception as e:
+            print(f"[Error] LuaJIT parse failed: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
+
     def _escape_lua_string(self, content: str) -> str:
         """Escape content for safe inclusion in Lua string"""
         # Use long bracket format for safety

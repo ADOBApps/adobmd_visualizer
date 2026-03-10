@@ -6,7 +6,7 @@
 -- the Free Software Foundation, either version 3 of the License, or
 -- (at your option) any later version.
 
-Copyright (C) [2026] Acxel David Orozco Baldomero
+-- Copyright (C) [2026] Acxel David Orozco Baldomero
 
 local ffi = require("ffi")
 
@@ -216,18 +216,69 @@ function M.parse_file(content)
     
     -- Build result as a single table
     local result = {
-        header = header,
-        masses = masses,
+        header = {
+            natoms = header.natoms,
+            nbonds = header.nbonds,
+            natom_types = header.natom_types,
+            has_box = header.has_box,
+            box_lo = {header.box_lo[1], header.box_lo[2], header.box_lo[3]},
+            box_hi = {header.box_hi[1], header.box_hi[2], header.box_hi[3]}
+        },
         type_elements = type_elements,
         atoms = atoms,
         bonds = bonds,
         qm_indices = qm_indices,
-        natoms = header.natoms,
-        nbonds = header.nbonds,
-        has_qm = #qm_indices > 0
+        has_qm = (#qm_indices > 0)
     }
     
-    return result
+    -- Convert to JSON string
+    return M.to_json(result)
+end
+
+-- Simple JSON encoder
+function M.to_json(obj)
+    local function encode(val)
+        local t = type(val)
+        
+        if t == "string" then
+            return '"' .. val:gsub('["\\]', '\\%0') .. '"'
+        elseif t == "number" then
+            return tostring(val)
+        elseif t == "boolean" then
+            return val and "true" or "false"
+        elseif t == "table" then
+            -- Check if array
+            local is_array = true
+            local max_idx = 0
+            for k in pairs(val) do
+                if type(k) ~= "number" or k < 1 then
+                    is_array = false
+                    break
+                end
+                max_idx = math.max(max_idx, k)
+            end
+            
+            if is_array and max_idx > 0 then
+                -- Array
+                local parts = {}
+                for i = 1, max_idx do
+                    parts[i] = encode(val[i]) or "null"
+                end
+                return "[" .. table.concat(parts, ",") .. "]"
+            else
+                -- Object
+                local parts = {}
+                for k, v in pairs(val) do
+                    parts[#parts+1] = encode(tostring(k)) .. ":" .. encode(v)
+                end
+                return "{" .. table.concat(parts, ",") .. "}"
+            end
+        else
+            return "null"
+        end
+    end
+    
+    return encode(obj)
 end
 
 -- CSV export function (fast)
