@@ -1,6 +1,5 @@
 """
-NetworkX-based molecular visualizer with selectable parser
-Options: Fortran (ULTRA FAST) or LuaJIT (FAST)
+NetworkX-based molecular visualizer with Fortran ULTRA-FAST parser
 """
 
 import numpy as np
@@ -45,14 +44,6 @@ except ImportError as e:
     FORTRAN_AVAILABLE = False
     print(f"[Warning] Fortran parser not available: {e}")
 
-# Try to import LuaJIT parser (FAST)
-try:
-    from .fast_parser import LuaJITFastParser
-    LUAJIT_AVAILABLE = True
-except ImportError as e:
-    LUAJIT_AVAILABLE = False
-    print(f"[Warning] LuaJIT parser not available: {e}")
-
 
 class SchlegelCanvas(FigureCanvas):
     """Molecular visualizer for Schlegel diagrams using NetworkX"""
@@ -71,6 +62,7 @@ class SchlegelCanvas(FigureCanvas):
         self.highlighted_nodes = []
         self.projection_point = [0.0, 0.0, 10.0]  # Default projection point
         self.view_angle = 45.0  # Default view angle
+        self.parser_used = "None"
         
         # Style
         self.fig.patch.set_facecolor('white')
@@ -257,6 +249,7 @@ class SchlegelCanvas(FigureCanvas):
         
         self.fig.tight_layout()
         self.draw()
+    
     def get_degree_distribution(self):
         """Get degree distribution of the molecular graph"""
         if self.graph:
@@ -320,7 +313,7 @@ class SchlegelCanvas(FigureCanvas):
 
 
 class VisualizerWidget(QWidget):
-    """Main widget with Schlegel diagram visualization and selectable parser"""
+    """Main widget with Schlegel diagram visualization and Fortran parser"""
     
     def __init__(self, plugin_instance=None):
         super().__init__()
@@ -328,14 +321,20 @@ class VisualizerWidget(QWidget):
         self.data = None
         self.current_file = ""
         self.last_export_dir = str(Path.home())
-        self.parser_used = "None"
         
-        # Initialize parsers
+        # Initialize Fortran parser
         self.fortran_parser = None
-        self.luajit_parser = None
         
-        # Try to initialize all available parsers
-        self.init_parsers()
+        # Try Fortran (ULTRA FAST)
+        if FORTRAN_AVAILABLE:
+            try:
+                from .fortran_parser import get_fortran_parser
+                self.fortran_parser = get_fortran_parser()
+                if self.fortran_parser:
+                    print("[Ok] Fortran ultra-fast parser initialized!")
+            except Exception as e:
+                print(f"[Warning] Fortran parser init error: {e}")
+                self.fortran_parser = None
         
         # Initialize Schlegel exporter (Fortran library)
         self.schlegel_exporter = None
@@ -350,56 +349,17 @@ class VisualizerWidget(QWidget):
         
         self.init_ui()
     
-    def init_parsers(self):
-        """Initialize all available parsers"""
-        # Try Fortran (ULTRA FAST)
-        if FORTRAN_AVAILABLE:
-            try:
-                from .fortran_parser import get_fortran_parser
-                self.fortran_parser = get_fortran_parser()
-                if self.fortran_parser:
-                    print("[Ok] Fortran ultra-fast parser initialized!")
-            except Exception as e:
-                print(f"[Warning] Fortran parser init error: {e}")
-                self.fortran_parser = None
-        
-        # Try LuaJIT (FAST)
-        if LUAJIT_AVAILABLE:
-            try:
-                from .fast_parser import LuaJITFastParser
-                self.luajit_parser = LuaJITFastParser()
-                if self.luajit_parser.initialize():
-                    print("[Ok] LuaJIT fast parser initialized!")
-                else:
-                    self.luajit_parser = None
-            except Exception as e:
-                print(f"[Warning] LuaJIT parser init error: {e}")
-                self.luajit_parser = None
-    
     def init_ui(self):
         layout = QVBoxLayout(self)
         
         # Status bar for parser info
         status_bar = QHBoxLayout()
         
-        # Parser selection dropdown
-        status_bar.addWidget(QLabel("Parser:"))
-        self.parser_combo = QComboBox()
-        
-        # Add available parsers to dropdown
-        if self.fortran_parser:
-            self.parser_combo.addItem("⚡⚡ Fortran (Ultra Fast)", "fortran")
-        if self.luajit_parser:
-            self.parser_combo.addItem("⚡ LuaJIT (Fast)", "luajit")
-        
-        # If no parsers available, show error but still enable UI
-        if self.parser_combo.count() == 0:
-            self.parser_combo.addItem("❌ No parsers available", "none")
-            print("[Error] No parsers available! Please install Fortran or LuaJIT.")
-        
-        self.parser_combo.setCurrentIndex(0)
-        self.parser_combo.setFixedWidth(200)
-        status_bar.addWidget(self.parser_combo)
+        # Fortran status only
+        parser_status = "Fortran" if self.fortran_parser else "No parser"
+        status_label = QLabel(f"Parser: {parser_status}")
+        status_label.setStyleSheet("background-color: #e0e0e0; padding: 2px 10px; border-radius: 3px;")
+        status_bar.addWidget(status_label)
         
         status_bar.addStretch()
         
@@ -605,17 +565,6 @@ class VisualizerWidget(QWidget):
         
         layout.addWidget(splitter)
     
-    def get_selected_parser(self):
-        """Get the parser selected by user"""
-        parser_type = self.parser_combo.currentData()
-        
-        if parser_type == "fortran" and self.fortran_parser:
-            return "fortran", self.fortran_parser
-        elif parser_type == "luajit" and self.luajit_parser:
-            return "luajit", self.luajit_parser
-        else:
-            return None, None
-    
     def load_file_fortran(self, file_path):
         """Load file using Fortran"""
         try:
@@ -677,72 +626,12 @@ class VisualizerWidget(QWidget):
             traceback.print_exc()
             return False
     
-    def load_file_luajit(self, file_path):
-        """Load file using LuaJIT"""
-        try:
-            if not self.luajit_parser.parser_loaded:
-                if not self.luajit_parser.initialize():
-                    return False
-            
-            result = self.luajit_parser.parse_file(file_path)
-            if not result:
-                return False
-            
-            # Convert to ADOBMDData
-            self.data = ADOBMDData()
-            self.data.filename = Path(file_path).name
-            
-            # Convert atoms
-            self.data.atoms = []
-            for a in result['atoms']:
-                atom = Atom(
-                    id=int(a['id']),
-                    type_id=int(a['type']),
-                    molecule=int(a['mol']),
-                    element=str(a['element']),
-                    x=float(a['x']),
-                    y=float(a['y']),
-                    z=float(a['z']),
-                    charge=float(a['charge']),
-                    is_qm=bool(a['qm'])
-                )
-                self.data.atoms.append(atom)
-            
-            # Convert bonds
-            self.data.bonds = []
-            if 'bonds' in result:
-                for b in result['bonds']:
-                    bond = Bond(
-                        id=int(b['id']),
-                        type_id=int(b['type']),
-                        atom1=int(b['a1']),
-                        atom2=int(b['a2']),
-                        order=int(b.get('order', b['type']))
-                    )
-                    self.data.bonds.append(bond)
-            
-            # Set box
-            if result['header']['has_box']:
-                self.data.has_box = True
-                self.data.box_lo = result['header']['box_lo']
-                self.data.box_hi = result['header']['box_hi']
-            
-            # Set QM indices
-            self.data.qm_indices = result.get('qm_indices', [])
-            self.data.has_qm_region = result.get('has_qm', False)
-            
-            self.data.natoms = len(self.data.atoms)
-            self.data.nbonds = len(self.data.bonds)
-            
-            self.canvas.parser_used = "LuaJIT"
-            return True
-            
-        except Exception as e:
-            print(f"[Error] LuaJIT parser error: {e}")
-            return False
-    
     def load_file(self):
-        """Load ADOBMD data file with selected parser"""
+        """Load ADOBMD data file with Fortran parser"""
+        if not self.fortran_parser:
+            QMessageBox.critical(self, "Error", "Fortran parser not available")
+            return
+        
         file_path, _ = QFileDialog.getOpenFileName(
             self, "Select ADOBMD Data File", "",
             "ADOBMD Files (*.data);;All Files (*)"
@@ -757,24 +646,11 @@ class VisualizerWidget(QWidget):
         QApplication.processEvents()
         
         start = time.time()
-        success = False
         
-        # Get selected parser
-        parser_type, parser = self.get_selected_parser()
-        
-        if parser_type == "fortran" and parser:
-            success = self.load_file_fortran(file_path)
-            parser_used = "Fortran"
-        elif parser_type == "luajit" and parser:
-            success = self.load_file_luajit(file_path)
-            parser_used = "LuaJIT"
-        else:
-            QMessageBox.critical(self, "Error", "No valid parser selected or available")
-            self.progress.setVisible(False)
-            return
+        success = self.load_file_fortran(file_path)
         
         if not success:
-            QMessageBox.critical(self, "Error", f"Failed to load file with {parser_used} parser")
+            QMessageBox.critical(self, "Error", "Failed to load file with Fortran parser")
             self.progress.setVisible(False)
             return
         
@@ -782,7 +658,7 @@ class VisualizerWidget(QWidget):
         
         # Update file label with timing
         time_str = f"{load_time*1000:.1f}ms" if load_time < 1.0 else f"{load_time:.2f}s"
-        self.file_label.setText(f"{self.data.filename} ({parser_used}: {time_str})")
+        self.file_label.setText(f"{self.data.filename} (Fortran: {time_str})")
         
         # Enable controls
         self.export_schlegel_btn.setEnabled(True)
@@ -793,14 +669,8 @@ class VisualizerWidget(QWidget):
         self.progress.setVisible(False)
         
         # Show success message with timing
-        speed_map = {
-            "Fortran": "⚡⚡ ULTRA FAST",
-            "LuaJIT": "⚡ FAST",
-        }
-        speed = speed_map.get(parser_used, "")
-        
         QMessageBox.information(self, "Success", 
-                               f"{speed} Loaded {len(self.data.atoms)} atoms, "
+                               f"⚡⚡ Fortran loaded {len(self.data.atoms)} atoms, "
                                f"{len(self.data.bonds)} bonds in {time_str}")
     
     def export_schlegel(self):
@@ -1011,7 +881,7 @@ MM atoms: {stats['mm_atoms']}
 Elements:
 {chr(10).join(f'  {k}: {v}' for k, v in sorted(stats['elements'].items()))}
 {graph_stats}"""
-    
+        
         if stats['box']:
             box = stats['box']
             text += f"\nBox: {box[0]:.1f} x {box[1]:.1f} x {box[2]:.1f} Å³"
