@@ -375,7 +375,6 @@ class VisualizerWidget(QWidget):
         
         self.load_btn = QPushButton("Load File")
         self.load_btn.clicked.connect(self.load_file)
-        self.load_btn.setFixedWidth(100)
         toolbar.addWidget(self.load_btn)
         
         # Projection type selector
@@ -412,13 +411,11 @@ class VisualizerWidget(QWidget):
         self.export_schlegel_btn = QPushButton("Generate Schlegel Projections")
         self.export_schlegel_btn.clicked.connect(self.export_schlegel)
         self.export_schlegel_btn.setEnabled(False)
-        self.export_schlegel_btn.setFixedWidth(220)
         export_bar.addWidget(self.export_schlegel_btn)
         
         self.open_folder_btn = QPushButton("Open Folder")
         self.open_folder_btn.clicked.connect(self.open_export_folder)
         self.open_folder_btn.setEnabled(False)
-        self.open_folder_btn.setFixedWidth(100)
         export_bar.addWidget(self.open_folder_btn)
         
         export_bar.addStretch()
