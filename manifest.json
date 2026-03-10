@@ -1,0 +1,32 @@
+{
+  "name": "ADOBMD Visualizer",
+  "id": "adobmd_visualizer",
+  "version": "1.0.0",
+  "author": "Acxel Orozco",
+  "description": "3D Visualizer for ADOBMD unified data files - View molecular structures, QM/MM regions, and bonds",
+  "type": "python",
+  "category": "tools",
+  "main": "__init__.py",
+  "dependencies": ["numpy", "matplotlib"],
+  "marketplace": {
+    "price": 0.0,
+    "currency": "USD",
+    "price_model": "free",
+    "payment_required": false
+  },
+  "license": {
+    "type": "free",
+    "max_activations": 100
+  },
+  
+  "config": {
+    "default_atom_scale": 0.5,
+    "default_bond_radius": 0.1,
+    "qm_color": [1.0, 0.2, 0.2],
+    "mm_color": [0.2, 0.6, 1.0],
+    "background_color": [0.1, 0.1, 0.1],
+    "show_box": true,
+    "show_bonds": true,
+    "show_axes": true
+  }
+}
