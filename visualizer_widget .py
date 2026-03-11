@@ -1,0 +1,1025 @@
+"""
+NetworkX-based molecular visualizer with selectable parser
+Options: Fortran (Linux - ULTRA FAST) or C (Windows - FAST)
+"""
+
+import numpy as np
+import matplotlib
+matplotlib.use('Qt5Agg')
+from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
+from matplotlib.backends.backend_qt5agg import NavigationToolbar2QT as NavigationToolbar
+from matplotlib.figure import Figure
+import networkx as nx
+from matplotlib.collections import LineCollection
+
+from PySide6.QtWidgets import (
+    QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
+    QLabel, QFileDialog, QGroupBox, QCheckBox, QApplication,
+    QComboBox, QSpinBox, QTextEdit, QSplitter, QMessageBox,
+    QRadioButton, QToolButton, QMenu, QProgressBar, QDoubleSpinBox
+)
+from PySide6.QtCore import Qt, QTimer
+from PySide6.QtGui import QFont, QAction, QDesktopServices
+from PySide6.QtCore import QUrl
+
+import time
+from pathlib import Path
+import os
+import sys
+import traceback
+import platform
+
+from .data_parser import ADOBMDData, Atom, Bond
+
+# Detect operating system
+IS_LINUX = platform.system() == 'Linux'
+IS_WINDOWS = platform.system() == 'Windows'
+print(f"[Info] Operating System: {platform.system()}")
+
+# Try to import molecular exporter for Schlegel projections
+try:
+    from .molecular_exporter import get_molecular_exporter
+    SCHLEGEL_AVAILABLE = True
+except ImportError as e:
+    SCHLEGEL_AVAILABLE = False
+    print(f"[Warning] Schlegel exporter not available: {e}")
+
+# Try to import Fortran parser (ULTRA FAST - Linux only)
+FORTRAN_AVAILABLE = False
+if IS_LINUX:
+    try:
+        from .fortran_parser import get_fortran_parser
+        FORTRAN_AVAILABLE = True
+        print("[Ok] Fortran ultra-fast parser available for Linux!")
+    except ImportError as e:
+        print(f"[Warning] Fortran parser not available on Linux: {e}")
+else:
+    print("[Info] Fortran parser is Linux-only, skipping on Windows")
+
+# Try to import C parser (FAST - Cross-platform, default on Windows)
+C_AVAILABLE = False
+try:
+    from .c_parser import get_c_parser
+    C_AVAILABLE = True
+    print(f"[Ok] C parser available for {platform.system()}!")
+except ImportError as e:
+    print(f"[Warning] C parser not available: {e}")
+
+
+class SchlegelCanvas(FigureCanvas):
+    """Molecular visualizer for Schlegel diagrams using NetworkX"""
+    
+    def __init__(self, parent=None, width=10, height=8, dpi=100):
+        self.fig = Figure(figsize=(width, height), dpi=dpi)
+        self.ax = self.fig.add_subplot(111)
+        super().__init__(self.fig)
+        self.setParent(parent)
+        
+        # Graph structure
+        self.graph = None
+        self.pos = None
+        self.data = None
+        self.selected_atom = None
+        self.highlighted_nodes = []
+        self.projection_point = [0.0, 0.0, 10.0]  # Default projection point
+        self.view_angle = 45.0  # Default view angle
+        self.parser_used = "None"
+        
+        # Style
+        self.fig.patch.set_facecolor('white')
+        self.ax.set_facecolor('white')
+        self.ax.grid(True, alpha=0.3)
+        self.ax.set_aspect('equal')
+        
+        # Connect pick event
+        self.fig.canvas.mpl_connect('pick_event', self.on_pick)
+    
+    def build_graph(self, data: ADOBMDData):
+        """Build NetworkX graph from molecular data"""
+        self.data = data
+        self.graph = nx.Graph()
+        
+        # Add nodes (atoms) with attributes
+        for atom in data.atoms:
+            self.graph.add_node(
+                atom.id,
+                element=atom.element,
+                charge=atom.charge,
+                is_qm=atom.is_qm,
+                x=atom.x, y=atom.y, z=atom.z,
+                radius=data.ELEMENT_RADII.get(atom.element, 0.5),
+                color=self._get_atom_color(atom, data)
+            )
+        
+        # Add edges (bonds) with attributes
+        for bond in data.bonds:
+            if bond.atom1 in self.graph and bond.atom2 in self.graph:
+                self.graph.add_edge(
+                    bond.atom1, bond.atom2,
+                    order=bond.order,
+                    type=bond.type_id
+                )
+        
+        return self.graph
+    
+    def _get_atom_color(self, atom, data):
+        """Get color for atom based on attributes"""
+        if atom.is_qm:
+            return 'red'
+        elif data.has_qm_region:
+            return 'blue'
+        else:
+            return data.ELEMENT_COLORS.get(atom.element, 'gray')
+    
+    def _perspective_projection(self, point):
+        """Apply perspective projection for Schlegel diagram"""
+        x, y, z = point
+        px, py, pz = self.projection_point
+        
+        # Distance from projection point
+        dz = pz - z
+        if abs(dz) < 1e-10:
+            return (x, y)
+        
+        # Perspective projection
+        factor = (pz - min(0, pz)) / dz  # Scale factor
+        proj_x = x * factor
+        proj_y = y * factor
+        
+        return (proj_x, proj_y)
+    
+    def _cone_projection(self, point):
+        """Apply cone projection for Schlegel diagram"""
+        x, y, z = point
+        px, py, pz = self.projection_point
+        angle_rad = self.view_angle * np.pi / 180.0
+        
+        r = np.sqrt(x*x + y*y)
+        if r < 1e-10:
+            return (0.0, 0.0)
+        
+        dz = pz - z
+        factor = np.tan(angle_rad) * dz / r
+        proj_x = x * factor
+        proj_y = y * factor
+        
+        return (proj_x, proj_y)
+    
+    def update_schlegel_positions(self, projection_type='perspective'):
+        """Update positions using Schlegel projection"""
+        if not self.graph:
+            return
+        
+        self.pos = {}
+        for node, attr in self.graph.nodes(data=True):
+            point = (attr['x'], attr['y'], attr['z'])
+            
+            if projection_type == 'perspective':
+                self.pos[node] = self._perspective_projection(point)
+            else:  # cone projection
+                self.pos[node] = self._cone_projection(point)
+    
+    def plot_system(self, data: ADOBMDData, projection_type='perspective',
+                   atom_size=300, color_by='region', highlight_atoms=None):
+        """
+        Plot molecular system as Schlegel diagram (preview only)
+        Actual projection files are generated by Fortran/C on demand
+        """
+        self.ax.clear()
+        self.ax.grid(True, alpha=0.3)
+        
+        # Build graph
+        self.build_graph(data)
+        
+        # Update positions with Schlegel projection (for preview)
+        self.update_schlegel_positions(projection_type)
+        
+        # Prepare node colors
+        node_colors = []
+        for node, attr in self.graph.nodes(data=True):
+            if color_by == 'region':
+                color = attr['color']
+            elif color_by == 'element':
+                color = data.ELEMENT_COLORS.get(attr['element'], 'gray')
+            elif color_by == 'charge':
+                if attr['charge'] < -0.1:
+                    color = 'darkblue'
+                elif attr['charge'] > 0.1:
+                    color = 'darkred'
+                else:
+                    color = 'gray'
+            else:
+                color = 'gray'
+            node_colors.append(color)
+        
+        # Calculate node sizes based on atomic radius
+        node_sizes = []
+        for node, attr in self.graph.nodes(data=True):
+            node_sizes.append(attr['radius'] * atom_size)
+        
+        # Draw nodes
+        nx.draw_networkx_nodes(
+            self.graph, self.pos,
+            node_color=node_colors,
+            node_size=node_sizes,
+            alpha=0.7,
+            linewidths=0.5,
+            edgecolors='black',
+            ax=self.ax
+        )
+        
+        # Draw highlighted nodes on top (if any)
+        if highlight_atoms:
+            highlight_nodes = [n for n in self.graph.nodes() if n in highlight_atoms]
+            if highlight_nodes:
+                highlight_sizes = [node_sizes[i] * 1.2 for i, n in enumerate(self.graph.nodes()) 
+                                 if n in highlight_atoms]
+                nx.draw_networkx_nodes(
+                    self.graph, self.pos,
+                    nodelist=highlight_nodes,
+                    node_color='yellow',
+                    node_size=highlight_sizes,
+                    alpha=1.0,
+                    linewidths=2,
+                    edgecolors='red',
+                    ax=self.ax
+                )
+        
+        # Draw edges
+        if data.bonds and self.graph.edges():
+            nx.draw_networkx_edges(
+                self.graph, self.pos,
+                edge_color='gray',
+                width=1.0,
+                alpha=0.5,
+                ax=self.ax
+            )
+        
+        # Labels
+        self.ax.set_xlabel('Schlegel X')
+        self.ax.set_ylabel('Schlegel Y')
+        
+        # Title
+        qm_info = f" - QM: {len(data.qm_indices)} atoms" if data.has_qm_region else ""
+        proj_type = "Perspective" if projection_type == 'perspective' else "Cone"
+        parser_info = f" [{self.parser_used}]" if hasattr(self, 'parser_used') else ""
+        self.ax.set_title(f"{data.filename}{parser_info} - {proj_type} Schlegel Preview{qm_info}")
+        
+        # Auto-scale
+        self._auto_scale()
+        
+        self.fig.tight_layout()
+        self.draw()
+    
+    def get_degree_distribution(self):
+        """Get degree distribution of the molecular graph"""
+        if self.graph:
+            return dict(self.graph.degree())
+        return {}
+
+    def find_cycles(self):
+        """Find cycles in the molecular graph"""
+        if self.graph:
+            return list(nx.cycle_basis(self.graph))
+        return []
+    
+    def _auto_scale(self):
+        """Auto-scale with padding"""
+        if not self.pos:
+            return
+        
+        x_coords = [p[0] for p in self.pos.values()]
+        y_coords = [p[1] for p in self.pos.values()]
+        
+        if not x_coords or not y_coords:
+            return
+        
+        x_min, x_max = min(x_coords), max(x_coords)
+        y_min, y_max = min(y_coords), max(y_coords)
+        
+        # Handle single atom case
+        if abs(x_max - x_min) < 1e-10:
+            x_min -= 5
+            x_max += 5
+        if abs(y_max - y_min) < 1e-10:
+            y_min -= 5
+            y_max += 5
+        
+        x_pad = (x_max - x_min) * 0.1
+        y_pad = (y_max - y_min) * 0.1
+        
+        self.ax.set_xlim(x_min - x_pad, x_max + x_pad)
+        self.ax.set_ylim(y_min - y_pad, y_max + y_pad)
+    
+    def on_pick(self, event):
+        """Handle atom selection"""
+        if not hasattr(event, 'ind') or not self.graph:
+            return
+        
+        node = list(self.graph.nodes())[event.ind[0]]
+        self.selected_atom = node
+        self.plot_system(self.data, highlight_atoms=[node])
+    
+    def set_projection_point(self, x, y, z):
+        """Set the projection point for Schlegel diagram"""
+        self.projection_point = [x, y, z]
+        if self.data:
+            self.plot_system(self.data)
+    
+    def set_view_angle(self, angle):
+        """Set the view angle for cone projection"""
+        self.view_angle = angle
+        if self.data:
+            self.plot_system(self.data)
+
+
+class VisualizerWidget(QWidget):
+    """Main widget with Schlegel diagram visualization"""
+    
+    def __init__(self, plugin_instance=None):
+        super().__init__()
+        self.plugin = plugin_instance
+        self.data = None
+        self.current_file = ""
+        self.last_export_dir = str(Path.home())
+        self.parser_used = "None"
+        
+        # Initialize parsers
+        self.fortran_parser = None
+        self.c_parser = None
+        
+        # Try Fortran on Linux
+        if IS_LINUX and FORTRAN_AVAILABLE:
+            try:
+                from .fortran_parser import get_fortran_parser
+                self.fortran_parser = get_fortran_parser()
+                if self.fortran_parser:
+                    print("[Ok] Fortran ultra-fast parser initialized for Linux!")
+            except Exception as e:
+                print(f"[Warning] Fortran parser init error: {e}")
+                self.fortran_parser = None
+        
+        # Try C parser (cross-platform)
+        if C_AVAILABLE:
+            try:
+                from .c_parser import get_c_parser
+                self.c_parser = get_c_parser()
+                if self.c_parser:
+                    print(f"[Ok] C fast parser initialized for {platform.system()}!")
+            except Exception as e:
+                print(f"[Warning] C parser init error: {e}")
+                self.c_parser = None
+        
+        # Initialize Schlegel exporter
+        self.schlegel_exporter = None
+        if SCHLEGEL_AVAILABLE:
+            try:
+                from .molecular_exporter import get_molecular_exporter
+                self.schlegel_exporter = get_molecular_exporter()
+                if self.schlegel_exporter:
+                    print(f"[Ok] Schlegel exporter available for {platform.system()}!")
+            except Exception as e:
+                print(f"[Warning] Schlegel exporter error: {e}")
+        
+        self.init_ui()
+    
+    def init_ui(self):
+        layout = QVBoxLayout(self)
+        
+        # Status bar with platform info and parser selection
+        status_bar = QHBoxLayout()
+        
+        # Platform indicator
+        platform_icon = "🐧" if IS_LINUX else "🪟"
+        platform_label = QLabel(f"{platform_icon} {platform.system()}")
+        platform_label.setStyleSheet("background-color: #e0e0e0; padding: 2px 10px; border-radius: 3px;")
+        status_bar.addWidget(platform_label)
+        
+        status_bar.addWidget(QLabel("Parser:"))
+        self.parser_combo = QComboBox()
+        
+        # Add available parsers to dropdown
+        if self.fortran_parser:
+            self.parser_combo.addItem("⚡⚡ Fortran (Ultra Fast - Linux)", "fortran")
+        
+        if self.c_parser:
+            speed = "Fast" if IS_WINDOWS else "Fast (Cross-platform)"
+            self.parser_combo.addItem(f"⚡ C ({speed})", "c")
+        
+        # If no parsers available, show error
+        if self.parser_combo.count() == 0:
+            self.parser_combo.addItem("❌ No parsers available", "none")
+            print("[Error] No parsers available! Please install C or Fortran parser.")
+        
+        self.parser_combo.setCurrentIndex(0)
+        self.parser_combo.setFixedWidth(250)
+        status_bar.addWidget(self.parser_combo)
+        
+        status_bar.addStretch()
+        
+        exporter_status = "✓" if self.schlegel_exporter else "✗"
+        status_label = QLabel(f"Exporter: {exporter_status}")
+        status_label.setStyleSheet("background-color: #e0e0e0; padding: 2px 10px; border-radius: 3px;")
+        status_bar.addWidget(status_label)
+        
+        layout.addLayout(status_bar)
+        
+        # Main toolbar
+        toolbar = QHBoxLayout()
+        
+        self.load_btn = QPushButton("Load File")
+        self.load_btn.clicked.connect(self.load_file)
+        toolbar.addWidget(self.load_btn)
+        
+        # Projection type selector
+        toolbar.addWidget(QLabel("Projection:"))
+        self.proj_combo = QComboBox()
+        self.proj_combo.addItems(["Perspective", "Cone"])
+        self.proj_combo.currentTextChanged.connect(self.update_plot)
+        self.proj_combo.setFixedWidth(100)
+        toolbar.addWidget(self.proj_combo)
+        
+        # View angle control (for cone projection)
+        toolbar.addWidget(QLabel("Angle:"))
+        self.angle_spin = QDoubleSpinBox()
+        self.angle_spin.setRange(10.0, 89.0)
+        self.angle_spin.setValue(45.0)
+        self.angle_spin.setSuffix("°")
+        self.angle_spin.valueChanged.connect(self.update_angle)
+        self.angle_spin.setEnabled(False)  # Disabled for perspective
+        self.angle_spin.setFixedWidth(80)
+        toolbar.addWidget(self.angle_spin)
+        
+        toolbar.addStretch()
+        
+        self.file_label = QLabel("No file loaded")
+        self.file_label.setStyleSheet("color: gray; padding: 5px;")
+        toolbar.addWidget(self.file_label)
+        
+        layout.addLayout(toolbar)
+        
+        # Schlegel export toolbar
+        export_bar = QHBoxLayout()
+        export_bar.addWidget(QLabel("Export:"))
+        
+        self.export_schlegel_btn = QPushButton("Generate Schlegel Projections")
+        self.export_schlegel_btn.clicked.connect(self.export_schlegel)
+        self.export_schlegel_btn.setEnabled(False)
+        export_bar.addWidget(self.export_schlegel_btn)
+        
+        self.open_folder_btn = QPushButton("Open Folder")
+        self.open_folder_btn.clicked.connect(self.open_export_folder)
+        self.open_folder_btn.setEnabled(False)
+        export_bar.addWidget(self.open_folder_btn)
+        
+        export_bar.addStretch()
+        
+        self.progress = QProgressBar()
+        self.progress.setVisible(False)
+        self.progress.setFixedWidth(150)
+        export_bar.addWidget(self.progress)
+        
+        layout.addLayout(export_bar)
+        
+        # Main splitter
+        splitter = QSplitter(Qt.Horizontal)
+        
+        # Left panel - Controls
+        left = QWidget()
+        left_layout = QVBoxLayout(left)
+        
+        # Display controls
+        display_group = QGroupBox("Display")
+        display = QVBoxLayout()
+        
+        # Color by
+        color_row = QHBoxLayout()
+        color_row.addWidget(QLabel("Color:"))
+        self.color_combo = QComboBox()
+        self.color_combo.addItems(["region", "element", "charge"])
+        self.color_combo.currentTextChanged.connect(self.update_plot)
+        color_row.addWidget(self.color_combo)
+        display.addLayout(color_row)
+        
+        # Atom size
+        size_row = QHBoxLayout()
+        size_row.addWidget(QLabel("Atom size:"))
+        self.size_spin = QSpinBox()
+        self.size_spin.setRange(50, 1000)
+        self.size_spin.setValue(300)
+        self.size_spin.valueChanged.connect(self.update_plot)
+        size_row.addWidget(self.size_spin)
+        display.addLayout(size_row)
+        
+        # Options
+        self.show_bonds = QCheckBox("Show Bonds")
+        self.show_bonds.setChecked(True)
+        self.show_bonds.toggled.connect(self.update_plot)
+        display.addWidget(self.show_bonds)
+        
+        display_group.setLayout(display)
+        left_layout.addWidget(display_group)
+        
+        # Projection point controls
+        proj_group = QGroupBox("Projection Point")
+        proj_layout = QVBoxLayout()
+        
+        # X coordinate
+        x_row = QHBoxLayout()
+        x_row.addWidget(QLabel("X:"))
+        self.proj_x = QDoubleSpinBox()
+        self.proj_x.setRange(-100, 100)
+        self.proj_x.setValue(0.0)
+        self.proj_x.setSingleStep(0.5)
+        self.proj_x.valueChanged.connect(self.update_projection_point)
+        x_row.addWidget(self.proj_x)
+        proj_layout.addLayout(x_row)
+        
+        # Y coordinate
+        y_row = QHBoxLayout()
+        y_row.addWidget(QLabel("Y:"))
+        self.proj_y = QDoubleSpinBox()
+        self.proj_y.setRange(-100, 100)
+        self.proj_y.setValue(0.0)
+        self.proj_y.setSingleStep(0.5)
+        self.proj_y.valueChanged.connect(self.update_projection_point)
+        y_row.addWidget(self.proj_y)
+        proj_layout.addLayout(y_row)
+        
+        # Z coordinate
+        z_row = QHBoxLayout()
+        z_row.addWidget(QLabel("Z:"))
+        self.proj_z = QDoubleSpinBox()
+        self.proj_z.setRange(-100, 200)
+        self.proj_z.setValue(10.0)
+        self.proj_z.setSingleStep(0.5)
+        self.proj_z.valueChanged.connect(self.update_projection_point)
+        z_row.addWidget(self.proj_z)
+        proj_layout.addLayout(z_row)
+        
+        proj_group.setLayout(proj_layout)
+        left_layout.addWidget(proj_group)
+        
+        # Filter controls
+        filter_group = QGroupBox("Filter")
+        filter = QVBoxLayout()
+        
+        self.show_all = QRadioButton("Show All")
+        self.show_all.setChecked(True)
+        self.show_all.toggled.connect(self.filter_atoms)
+        filter.addWidget(self.show_all)
+        
+        self.show_qm = QRadioButton("QM Only")
+        self.show_qm.toggled.connect(self.filter_atoms)
+        filter.addWidget(self.show_qm)
+        
+        self.show_mm = QRadioButton("MM Only")
+        self.show_mm.toggled.connect(self.filter_atoms)
+        filter.addWidget(self.show_mm)
+        
+        filter_group.setLayout(filter)
+        left_layout.addWidget(filter_group)
+        
+        # Generated files info
+        files_group = QGroupBox("Generated Projections")
+        self.files_text = QTextEdit()
+        self.files_text.setReadOnly(True)
+        self.files_text.setMaximumHeight(100)
+        self.files_text.setFont(QFont("Courier New", 8))
+        files_group.setLayout(QVBoxLayout())
+        files_group.layout().addWidget(self.files_text)
+        left_layout.addWidget(files_group)
+        
+        # Statistics
+        stats_group = QGroupBox("Statistics")
+        self.stats_text = QTextEdit()
+        self.stats_text.setReadOnly(True)
+        self.stats_text.setMaximumHeight(150)
+        self.stats_text.setFont(QFont("Courier New", 9))
+        stats_group.setLayout(QVBoxLayout())
+        stats_group.layout().addWidget(self.stats_text)
+        left_layout.addWidget(stats_group)
+        
+        left_layout.addStretch()
+        
+        # Right panel - Canvas
+        right = QWidget()
+        right_layout = QVBoxLayout(right)
+        self.canvas = SchlegelCanvas(self)
+        self.toolbar = NavigationToolbar(self.canvas, self)
+        right_layout.addWidget(self.toolbar)
+        right_layout.addWidget(self.canvas)
+        
+        splitter.addWidget(left)
+        splitter.addWidget(right)
+        splitter.setSizes([400, 600])
+        
+        layout.addWidget(splitter)
+    
+    def get_selected_parser(self):
+        """Get the parser selected by user"""
+        parser_type = self.parser_combo.currentData()
+        
+        if parser_type == "fortran" and self.fortran_parser:
+            return "fortran", self.fortran_parser
+        elif parser_type == "c" and self.c_parser:
+            return "c", self.c_parser
+        else:
+            return None, None
+    
+    def load_file_fortran(self, file_path):
+        """Load file using Fortran"""
+        try:
+            result = self.fortran_parser.parse_file(file_path)
+            if not result:
+                return False
+            
+            # Convert to ADOBMDData
+            self.data = ADOBMDData()
+            self.data.filename = Path(file_path).name
+            
+            # Convert atoms
+            self.data.atoms = []
+            for a in result['atoms']:
+                atom = Atom(
+                    id=int(a['id']),
+                    type_id=int(a['type_id']),
+                    molecule=int(a['molecule']),
+                    element=str(a['element']),
+                    x=float(a['x']),
+                    y=float(a['y']),
+                    z=float(a['z']),
+                    charge=float(a['charge']),
+                    is_qm=bool(a['is_qm'])
+                )
+                self.data.atoms.append(atom)
+            
+            # Convert bonds
+            self.data.bonds = []
+            if 'bonds' in result:
+                for b in result['bonds']:
+                    bond = Bond(
+                        id=int(b['id']),
+                        type_id=int(b['type_id']),
+                        atom1=int(b['atom1']),
+                        atom2=int(b['atom2']),
+                        order=int(b.get('order', b['type_id']))
+                    )
+                    self.data.bonds.append(bond)
+            
+            # Set box
+            if result.get('has_box', False):
+                self.data.has_box = True
+                self.data.box_lo = result.get('box_lo', [0,0,0])
+                self.data.box_hi = result.get('box_hi', [0,0,0])
+            
+            # Set QM indices
+            self.data.qm_indices = result.get('qm_indices', [])
+            self.data.has_qm_region = len(self.data.qm_indices) > 0
+            
+            self.data.natoms = len(self.data.atoms)
+            self.data.nbonds = len(self.data.bonds)
+            
+            self.canvas.parser_used = "Fortran"
+            return True
+            
+        except Exception as e:
+            print(f"[Error] Fortran parser error: {e}")
+            traceback.print_exc()
+            return False
+    
+    def load_file_c(self, file_path):
+        """Load file using C parser"""
+        try:
+            result = self.c_parser.parse_file(file_path)
+            if not result:
+                return False
+            
+            # Convert to ADOBMDData
+            self.data = ADOBMDData()
+            self.data.filename = Path(file_path).name
+            
+            # Convert atoms
+            self.data.atoms = []
+            for a in result['atoms']:
+                atom = Atom(
+                    id=int(a['id']),
+                    type_id=int(a['type_id']),
+                    molecule=int(a['molecule']),
+                    element=str(a['element']),
+                    x=float(a['x']),
+                    y=float(a['y']),
+                    z=float(a['z']),
+                    charge=float(a['charge']),
+                    is_qm=bool(a['is_qm'])
+                )
+                self.data.atoms.append(atom)
+            
+            # Convert bonds
+            self.data.bonds = []
+            if 'bonds' in result:
+                for b in result['bonds']:
+                    bond = Bond(
+                        id=int(b['id']),
+                        type_id=int(b['type_id']),
+                        atom1=int(b['atom1']),
+                        atom2=int(b['atom2']),
+                        order=int(b.get('order', b['type_id']))
+                    )
+                    self.data.bonds.append(bond)
+            
+            # Set box
+            if result.get('has_box', False):
+                self.data.has_box = True
+                self.data.box_lo = result.get('box_lo', [0,0,0])
+                self.data.box_hi = result.get('box_hi', [0,0,0])
+            
+            # Set QM indices
+            self.data.qm_indices = result.get('qm_indices', [])
+            self.data.has_qm_region = len(self.data.qm_indices) > 0
+            
+            self.data.natoms = len(self.data.atoms)
+            self.data.nbonds = len(self.data.bonds)
+            
+            self.canvas.parser_used = "C"
+            return True
+            
+        except Exception as e:
+            print(f"[Error] C parser error: {e}")
+            traceback.print_exc()
+            return False
+    
+    def load_file(self):
+        """Load ADOBMD data file with selected parser"""
+        file_path, _ = QFileDialog.getOpenFileName(
+            self, "Select ADOBMD Data File", "",
+            "ADOBMD Files (*.data);;All Files (*)"
+        )
+        
+        if not file_path:
+            return
+        
+        self.current_file = file_path
+        self.progress.setVisible(True)
+        self.progress.setRange(0, 0)
+        QApplication.processEvents()
+        
+        start = time.time()
+        success = False
+        parser_name = ""
+        
+        # Get selected parser
+        parser_type, parser = self.get_selected_parser()
+        
+        if parser_type == "fortran" and parser:
+            success = self.load_file_fortran(file_path)
+            parser_name = "Fortran"
+        elif parser_type == "c" and parser:
+            success = self.load_file_c(file_path)
+            parser_name = "C"
+        else:
+            QMessageBox.critical(self, "Error", "No valid parser selected or available")
+            self.progress.setVisible(False)
+            return
+        
+        if not success:
+            QMessageBox.critical(self, "Error", f"Failed to load file with {parser_name} parser")
+            self.progress.setVisible(False)
+            return
+        
+        load_time = time.time() - start
+        
+        # Update file label with timing
+        time_str = f"{load_time*1000:.1f}ms" if load_time < 1.0 else f"{load_time:.2f}s"
+        self.file_label.setText(f"{self.data.filename} ({parser_name}: {time_str})")
+        
+        # Enable controls
+        self.export_schlegel_btn.setEnabled(True)
+        
+        self.update_plot()
+        self.update_statistics()
+        
+        self.progress.setVisible(False)
+        
+        # Show success message with timing
+        speed = "⚡⚡ ULTRA FAST" if parser_name == "Fortran" else "⚡ FAST"
+        QMessageBox.information(self, "Success", 
+                               f"{speed} {parser_name} loaded {len(self.data.atoms)} atoms, "
+                               f"{len(self.data.bonds)} bonds in {time_str}")
+    
+    def export_schlegel(self):
+        """Call Fortran/C to generate Schlegel projection files"""
+        if not self.data or not self.schlegel_exporter:
+            QMessageBox.warning(self, "Warning", "Schlegel exporter not available")
+            return
+        
+        # Ask user where to save
+        dir_path = QFileDialog.getExistingDirectory(
+            self, "Select Directory for Schlegel Projections", 
+            self.last_export_dir
+        )
+        
+        if not dir_path:
+            return
+        
+        self.last_export_dir = dir_path
+        base_name = Path(dir_path) / Path(self.current_file).stem
+        
+        self.progress.setVisible(True)
+        self.progress.setRange(0, 0)
+        QApplication.processEvents()
+        
+        try:
+            # Prepare data for exporter
+            atoms_list = []
+            for atom in self.data.atoms:
+                atoms_list.append({
+                    'id': atom.id,
+                    'type_id': atom.type_id,
+                    'molecule': atom.molecule,
+                    'element': atom.element,
+                    'x': atom.x,
+                    'y': atom.y,
+                    'z': atom.z,
+                    'charge': atom.charge,
+                    'is_qm': atom.is_qm
+                })
+            
+            bonds_list = []
+            for bond in self.data.bonds:
+                bonds_list.append({
+                    'id': bond.id,
+                    'type_id': bond.type_id,
+                    'atom1': bond.atom1,
+                    'atom2': bond.atom2,
+                    'order': bond.order
+                })
+            
+            # Projection point from UI
+            proj_point = (self.proj_x.value(), self.proj_y.value(), self.proj_z.value())
+            view_angle = self.angle_spin.value()
+            
+            # Call exporter to generate all formats + Schlegel projections
+            start_time = time.time()
+            success = self.schlegel_exporter.export_all(
+                str(base_name),
+                atoms_list,
+                bonds_list,
+                box=(self.data.box_hi[0] - self.data.box_lo[0],
+                     self.data.box_hi[1] - self.data.box_lo[1],
+                     self.data.box_hi[2] - self.data.box_lo[2]) if self.data.has_box else None,
+                projection_point=proj_point,
+                view_angle=view_angle
+            )
+            
+            elapsed = time.time() - start_time
+            
+            if success:
+                # List generated files
+                files = [
+                    f"{base_name}.xyz",
+                    f"{base_name}.pdb",
+                    f"{base_name}.sdf",
+                    f"{base_name}.mol2",
+                    f"{base_name}.cif",
+                    f"{base_name}.gro",
+                    f"{base_name}_xy.txt",
+                    f"{base_name}_xz.txt",
+                    f"{base_name}_yz.txt",
+                    f"{base_name}_schlegel.txt",
+                    f"{base_name}_qm_mm.txt",
+                ]
+                
+                existing_files = [f for f in files if Path(f).exists()]
+                
+                # Update files info
+                self.files_text.clear()
+                self.files_text.append(f"✅ Generated {len(existing_files)} files:")
+                for f in existing_files[:5]:
+                    self.files_text.append(f"  • {Path(f).name}")
+                if len(existing_files) > 5:
+                    self.files_text.append(f"  ... and {len(existing_files)-5} more")
+                
+                self.open_folder_btn.setEnabled(True)
+                
+                QMessageBox.information(
+                    self, "Success",
+                    f"✅ Generated {len(existing_files)} files in {elapsed*1000:.1f}ms\n\n"
+                    f"Files saved to:\n{dir_path}"
+                )
+            else:
+                QMessageBox.critical(self, "Error", "Export failed")
+                
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Export failed: {str(e)}")
+            traceback.print_exc()
+        
+        self.progress.setVisible(False)
+    
+    def open_export_folder(self):
+        """Open the folder containing exported files"""
+        if hasattr(self, 'last_export_dir') and Path(self.last_export_dir).exists():
+            QDesktopServices.openUrl(QUrl.fromLocalFile(self.last_export_dir))
+    
+    def update_plot(self):
+        """Update visualization (preview only)"""
+        if not self.data:
+            return
+        
+        # Determine projection type
+        proj_type = 'perspective' if self.proj_combo.currentText() == 'Perspective' else 'cone'
+        
+        # Filter atoms
+        atoms_to_show = []
+        if self.show_all.isChecked():
+            atoms_to_show = self.data.atoms
+        elif self.show_qm.isChecked():
+            atoms_to_show = [a for a in self.data.atoms if a.is_qm]
+        elif self.show_mm.isChecked():
+            atoms_to_show = [a for a in self.data.atoms if not a.is_qm]
+        
+        # Create filtered data
+        if len(atoms_to_show) != len(self.data.atoms):
+            filtered = ADOBMDData()
+            filtered.atoms = atoms_to_show
+            filtered.bonds = self.data.bonds
+            filtered.has_box = self.data.has_box
+            filtered.box_lo = self.data.box_lo
+            filtered.box_hi = self.data.box_hi
+            filtered.filename = self.data.filename
+            filtered.qm_indices = self.data.qm_indices
+            filtered.has_qm_region = self.data.has_qm_region
+            plot_data = filtered
+        else:
+            plot_data = self.data
+        
+        # Update canvas
+        self.canvas.plot_system(
+            plot_data,
+            projection_type=proj_type,
+            atom_size=self.size_spin.value(),
+            color_by=self.color_combo.currentText()
+        )
+    
+    def update_projection_point(self):
+        """Update projection point in canvas"""
+        self.canvas.set_projection_point(
+            self.proj_x.value(),
+            self.proj_y.value(),
+            self.proj_z.value()
+        )
+    
+    def update_angle(self):
+        """Update view angle in canvas"""
+        self.canvas.set_view_angle(self.angle_spin.value())
+        self.angle_spin.setEnabled(self.proj_combo.currentText() == 'Cone')
+    
+    def filter_atoms(self):
+        """Filter atoms"""
+        self.update_plot()
+        self.update_statistics()
+    
+    def update_statistics(self):
+        """Update statistics display"""
+        if not self.data:
+            return
+        
+        stats = self.data.get_statistics()
+        
+        # Graph analysis if available
+        graph_stats = ""
+        if hasattr(self.canvas, 'graph') and self.canvas.graph:
+            try:
+                degrees = self.canvas.get_degree_distribution()
+                if degrees:
+                    avg_degree = sum(degrees.values()) / len(degrees)
+                    cycles = self.canvas.find_cycles()
+                    
+                    graph_stats = f"\nGraph Analysis:\n"
+                    graph_stats += f"  Average degree: {avg_degree:.2f}\n"
+                    graph_stats += f"  Cycles found: {len(cycles)}\n"
+                    if cycles:
+                        graph_stats += f"  Largest cycle: {len(max(cycles, key=len))} atoms\n"
+            except Exception as e:
+                print(f"[Warning] Graph analysis failed: {e}")
+        
+        # Parser info
+        parser_info = f"\nParser: {getattr(self.canvas, 'parser_used', 'Unknown')}"
+        
+        text = f"""File: {self.data.filename}
+Atoms: {stats['atoms']}
+Bonds: {stats['bonds']}
+QM atoms: {stats['qm_atoms']}
+MM atoms: {stats['mm_atoms']}
+
+Elements:
+{chr(10).join(f'  {k}: {v}' for k, v in sorted(stats['elements'].items()))}
+{graph_stats}"""
+        
+        if stats['box']:
+            box = stats['box']
+            text += f"\nBox: {box[0]:.1f} x {box[1]:.1f} x {box[2]:.1f} Å³"
+        
+        text += parser_info
+        
+        self.stats_text.setText(text)
